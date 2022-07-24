@@ -25,6 +25,23 @@
 #include <limits.h>
 #include <unistd.h>
 #include <err.h>
+#include <sys/stat.h>
+
+enum OUTPUT_FORMAT {
+    OUTPUT_FORMAT_STANDARD = 0,
+    OUTPUT_FORMAT_JSON
+};
+
+// https://www.gnu.org/software/tar/manual/html_node/Dumpdir.html#Dumpdir
+const char CONTROL_CODE_IN_ARCHIVE = 'Y';
+const char CONTROL_CODE_NOT_IN_ARCHIVE = 'N';
+const char CONTROL_CODE_DIRECTORY = 'D';
+const char CONTROL_CODE_RENAME = 'R';
+const char CONTROL_CODE_TARGET = 'T';
+const char CONTROL_CODE_TEMP_DIRECTORY = 'X';
+
+int summary_option = 0;
+int quiet_option = 0;
 
 struct cleanup_data
 {
@@ -69,6 +86,14 @@ struct directory_filter_flags
 	char control_code_D : 1;
 	char empty : 1;
 };
+
+struct snar_summary
+{
+    int total_files;
+    int files;
+    int file_size;
+};
+struct snar_summary snarSummary = {0, 0, 0};
 
 int match_string(FILE *file, const char *text)
 {
@@ -323,6 +348,16 @@ struct directory_filter_flags parse_directory_filter_flags(char *specifiers)
 	return result;
 }
 
+enum OUTPUT_FORMAT parse_format_option(char *format){
+    if(strcmp(format, "JSON") == 0){
+        return OUTPUT_FORMAT_JSON;
+    }else if(strcmp(format, "STANDARD") == 0){
+        return OUTPUT_FORMAT_STANDARD;
+    }else{
+        errx(1, "invalid argument '%s' for '-f'\nTry 'lsnar -h' for more information.", format);
+    }
+}
+
 int match_control_code(char control_code, const struct directory_filter_flags *filter_flags)
 {
 	switch (control_code)
@@ -341,9 +376,27 @@ int match_control_code(char control_code, const struct directory_filter_flags *f
 	}
 }
 
-void print_file(struct dumpdir_file *file)
+void print_file(struct dumpdir_file *file, struct snar_directory *dir)
 {
-	printf("    File: %c %s\n", file->control_code, file->filename);
+    if(!quiet_option){
+        printf("    File: %c %s\n", file->control_code, file->filename);
+    }
+    if(file->control_code == CONTROL_CODE_IN_ARCHIVE){
+        snarSummary.files++;
+        snarSummary.total_files++;
+
+        char filepath[1000] = "";
+        strcat(filepath, dir->name);
+        strcat(filepath, "/");
+        strcat(filepath, file->filename);
+        if (access(filepath, F_OK) == 0) {
+            struct stat fileStats;
+            stat(filepath, &fileStats);
+            snarSummary.file_size += fileStats.st_size;
+        }
+    }else if(file->control_code == CONTROL_CODE_NOT_IN_ARCHIVE){
+        snarSummary.total_files++;
+    }
 }
 
 void print_directory(struct snar_directory *dir, const struct directory_filter_flags *filter_flags)
@@ -351,20 +404,25 @@ void print_directory(struct snar_directory *dir, const struct directory_filter_f
 	if (dir->num_files == 0 && !filter_flags->empty)
 		return;
 
-	printf("%s\n\n", dir->name);
-	printf("     NFS: %s\n", dir->nfs ? "Yes" : "No");
 
-	char time_str[32];
-	format_timestamp(time_str, sizeof(time_str), dir->timestamp_sec, dir->timestamp_nsec);
-	printf("  Modify: %s\n", time_str);
+    if(!quiet_option){
+        printf("%s\n\n", dir->name);
+        printf("     NFS: %s\n", dir->nfs ? "Yes" : "No");
 
-	printf("     Dev: %lld\n", dir->dev);
-	printf("   Inode: %lld\n", dir->ino);
+        char time_str[32];
+        format_timestamp(time_str, sizeof(time_str), dir->timestamp_sec, dir->timestamp_nsec);
+        printf("  Modify: %s\n", time_str);
+
+        printf("     Dev: %lld\n", dir->dev);
+        printf("   Inode: %lld\n", dir->ino);
+    }
 
 	for (size_t f = 0; f < dir->num_files; ++f)
-		print_file(&dir->files[f]);
+		print_file(&dir->files[f], dir);
 
-	printf("\n");
+    if(!quiet_option){
+	    printf("\n");
+    }
 }
 
 void print_snar(struct snar_file *sf, const struct directory_filter_flags *filter_flags)
@@ -502,7 +560,10 @@ int read_snar_version(FILE *file)
 	long long v;
 	if (read_longlong(file, &v))
 	{
-		printf("Program Version: GNU tar-%s\n", tar_version);
+	    if(!quiet_option){
+	        printf("Program Version: GNU tar-%s\n", tar_version);
+	    }
+
 		return (int)v;
 	}
 
@@ -519,7 +580,9 @@ void read_snar(struct snar_file *sf, FILE *file)
 	if (sf->version == -1)
 		errx(1, "unrecognized file format");
 
-	printf(" Format Version: %d\n", sf->version);
+    if(!quiet_option){
+        printf(" Format Version: %d\n", sf->version);
+    }
 	if (sf->version != 2)
 		errx(1, "unsupported file format version");
 
@@ -535,7 +598,9 @@ void read_snar(struct snar_file *sf, FILE *file)
 
 	char time_str[32];
 	format_timestamp(time_str, sizeof(time_str), sf->timestamp_sec, sf->timestamp_nsec);
-	printf("    Backup Time: %s\n\n", time_str);
+	if(!quiet_option){
+	    printf("    Backup Time: %s\n\n", time_str);
+	}
 
 	expect_null(file);
 }
@@ -562,6 +627,11 @@ void print_help()
 	printf("                D - entries that are directories\n");
 	printf("                0 - matches directory records containing no entries\n");
 	printf("            the default behavior is equivalent to -tYND0\n");
+	printf(" -S         Display a summary of the snapshot\n");
+	printf(" -q         Suppress all output except summary\n");
+	printf(" -f FORMAT  Display the summary in a specific format\n");
+	printf("         STANDARD - (default) output in human readable text\n");
+	printf("             JSON - output in json\n");
 	printf(" -h         displays this help message\n");
 
 	printf("\n");
@@ -576,11 +646,12 @@ int main(int argc, char **argv)
 	int sort_option = 0;
 	int header_only_option = 0;
 	struct directory_filter_flags filter_flags = parse_directory_filter_flags("YND0");
+	enum OUTPUT_FORMAT format_option = OUTPUT_FORMAT_STANDARD;
 
 	tzset();
 
 	int opt;
-	while ((opt = getopt(argc, argv, "sHt:h")) !=  -1)
+	while ((opt = getopt(argc, argv, "sHSqtf:h")) !=  -1)
 	{
 		switch (opt)
 		{
@@ -596,6 +667,15 @@ int main(int argc, char **argv)
 			case 'h':
 				print_help();
 				exit(0);
+				break;
+			case 'S':
+			    summary_option = 1;
+			    break;
+			case 'q':
+			    quiet_option = 1;
+			    break;
+			case 'f':
+				format_option = parse_format_option(optarg);
 				break;
 			default:
 				printf("Try 'lsnar -h' for more information.\n");
@@ -636,7 +716,7 @@ int main(int argc, char **argv)
 		}
 		else
 		{
-			print_directory(&d, &filter_flags);
+		    print_directory(&d, &filter_flags);
 			snar_directory_free(&d);
 		}
 	} while (!peek_null(file) && !feof(file)); // more directories?
@@ -647,10 +727,22 @@ int main(int argc, char **argv)
 	if (sort_option)
 	{
 		sort_snar(sf);
-		print_snar(sf, &filter_flags);
+		if(!quiet_option){
+		    print_snar(sf, &filter_flags);
+		}
 	}
 
 	snar_free(sf);
+
+	if(summary_option){
+	    if(format_option == OUTPUT_FORMAT_STANDARD){
+            printf("Summary: \n");
+            printf("    Files In Archive: %d (Total Size: %db)\n", snarSummary.files, snarSummary.file_size);
+            printf("    Total Examined Files: %d\n", snarSummary.total_files);
+	    }else if(format_option == OUTPUT_FORMAT_JSON){
+	        printf("{\"total_files\": %d, \"files_in_archive\": %d, \"files_in_archive_size\": %d}", snarSummary.total_files, snarSummary.files, snarSummary.file_size);
+	    }
+	}
 
 	return 0;
 }
